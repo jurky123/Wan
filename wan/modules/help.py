@@ -3,7 +3,7 @@ import torch
 import matplotlib.pyplot as plt
 import numpy as np
 import lpips
-exp_idx=17
+exp_idx=18
 
 
 def save_attention_heatmap(q, k, v, grid_sizes, save_dir="attn_maps",
