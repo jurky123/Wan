@@ -20,7 +20,6 @@ from wan.distributed.util import init_distributed_group
 from wan.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
 from wan.utils.utils import merge_video_audio, save_video, str2bool
 
-
 EXAMPLE_PROMPT = {
     "t2v-A14B": {
         "prompt":
@@ -35,12 +34,6 @@ EXAMPLE_PROMPT = {
     "ti2v-5B": {
         "prompt":
             "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage.",
-    },
-    "animate-14B": {
-        "prompt": "视频中的人在做动作",
-        "video": "",
-        "pose": "",
-        "mask": "",
     },
     "s2v-14B": {
         "prompt":
@@ -222,29 +215,6 @@ def _parse_args():
         default=False,
         help="Whether to convert model paramerters dtype.")
 
-    # animate
-    parser.add_argument(
-        "--src_root_path",
-        type=str,
-        default=None,
-        help="The file of the process output path. Default None.")
-    parser.add_argument(
-        "--refert_num",
-        type=int,
-        default=77,
-        help="How many frames used for temporal guidance. Recommended to be 1 or 5."
-    )
-    parser.add_argument(
-        "--replace_flag",
-        action="store_true",
-        default=False,
-        help="Whether to use replace.")
-    parser.add_argument(
-        "--use_relighting_lora",
-        action="store_true",
-        default=False,
-        help="Whether to use relighting lora.")
-    
     # following args only works for s2v
     parser.add_argument(
         "--num_clip",
@@ -294,7 +264,9 @@ def _parse_args():
         default=80,
         help="Number of frames per clip, 48 or 80 or others (must be multiple of 4) for 14B s2v"
     )
+
     args = parser.parse_args()
+
     _validate_args(args)
 
     return args
@@ -452,33 +424,6 @@ def generate(args):
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
             offload_model=args.offload_model)
-    elif "animate" in args.task:
-        logging.info("Creating Wan-Animate pipeline.")
-        wan_animate = wan.WanAnimate(
-            config=cfg,
-            checkpoint_dir=args.ckpt_dir,
-            device_id=device,
-            rank=rank,
-            t5_fsdp=args.t5_fsdp,
-            dit_fsdp=args.dit_fsdp,
-            use_sp=(args.ulysses_size > 1),
-            t5_cpu=args.t5_cpu,
-            convert_model_dtype=args.convert_model_dtype,
-            use_relighting_lora=args.use_relighting_lora
-        )
-
-        logging.info(f"Generating video ...")
-        video = wan_animate.generate(
-            src_root_path=args.src_root_path,
-            replace_flag=args.replace_flag,
-            refert_num = args.refert_num,
-            clip_len=args.frame_num,
-            shift=args.sample_shift,
-            sample_solver=args.sample_solver,
-            sampling_steps=args.sample_steps,
-            guide_scale=args.sample_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model)
     elif "s2v" in args.task:
         logging.info("Creating WanS2V pipeline.")
         wan_s2v = wan.WanS2V(
@@ -513,6 +458,7 @@ def generate(args):
             offload_model=args.offload_model,
             init_first_frame=args.start_from_ref,
         )
+
     else:
         logging.info("Creating WanI2V pipeline.")
         wan_i2v = wan.WanI2V(
@@ -526,6 +472,7 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
         )
+
         logging.info("Generating video ...")
         video = wan_i2v.generate(
             args.prompt,
@@ -545,21 +492,55 @@ def generate(args):
             formatted_prompt = args.prompt.replace(" ", "_").replace("/",
                                                                      "_")[:50]
             suffix = '.mp4'
-            args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{formatted_prompt}_{formatted_time}" + suffix
+            base_name = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{formatted_prompt}_{formatted_time}"
+        else:
+            base_name = args.save_file.replace('.mp4', '')
 
-        logging.info(f"Saving generated video to {args.save_file}")
-        save_video(
-            tensor=video[None],
-            save_file=args.save_file,
-            fps=cfg.sample_fps,
-            nrow=1,
-            normalize=True,
-            value_range=(-1, 1))
-        if "s2v" in args.task:
-            if args.enable_tts is False:
-                merge_video_audio(video_path=args.save_file, audio_path=args.audio)
-            else:
-                merge_video_audio(video_path=args.save_file, audio_path="tts.wav")
+        # === 修改：分别保存三条视频 ===
+        attn_names = ["low", "high","weight_low","weight_high","random","flash"]
+        #attn_names = ["flash"]
+        from wan.modules.help import compute_lpips as calculate_lpips
+        from wan.modules.help import exp_idx
+        for idx in range(len(video)):
+            video_tensor = video[idx]
+            video_base = video[len(video)-1]
+            save_path = os.path.join("videos",f"{base_name}_{attn_names[idx]}.mp4")
+            text_root = os.path.join("Exps", "textdata", f"exp{exp_idx}")
+            logging.info(f"Saving generated video to {save_path}")
+            save_video(
+                tensor=video_tensor[None],
+                save_file=save_path,
+                fps=cfg.sample_fps,
+                nrow=1,
+                normalize=True,
+                value_range=(-1, 1))
+            lpips_scores = []
+            T = video_tensor.shape[1] # T = 21
+            for t in range(T):
+                #  提取单帧。
+                # - 原始张量: [C, T, H, W]
+                # - 提取第 t 帧: [C, H, W] -> 形状是 [3, H, W]
+                frame_base = video_base[:, t, :, :]
+                frame_accel = video_tensor[:, t, :, :]
+                
+                # 4. 准备 LPIPS 输入。LPIPS 需要 [B=1, C=3, H, W]
+                # frame_base.unsqueeze(0) 将 [3, H, W] 变为 [1, 3, H, W]
+                score = calculate_lpips(frame_base.unsqueeze(0), frame_accel.unsqueeze(0))
+                
+                lpips_scores.append(score)
+
+            # 5. 计算平均 LPIPS
+            if lpips_scores:
+                average_lpips = sum(lpips_scores) / len(lpips_scores)
+            text_path = os.path.join(text_root, f"exp_infos.txt")
+            os.makedirs(text_root, exist_ok=True)
+            with open(text_path, "a") as f:
+                f.write(f"{attn_names[idx]} LPIPS: {average_lpips:.6f}\n")
+            if "s2v" in args.task:
+                if args.enable_tts is False:
+                    merge_video_audio(video_path=save_path, audio_path=args.audio)
+                else:
+                    merge_video_audio(video_path=save_path, audio_path="tts.wav")
     del video
 
     torch.cuda.synchronize()

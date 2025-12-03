@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
+from .entropy import perturb_flash_attention_scores
 
 from .attention import flash_attention
 
@@ -123,7 +124,7 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs):
+    def forward(self, x, seq_lens, grid_sizes, freqs, current_step=0, attn_mode="flash",block_idx=0,cond_uncond=None):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -133,21 +134,109 @@ class WanSelfAttention(nn.Module):
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
+        #分别实验
         # query, key, value function
         def qkv_fn(x):
             q = self.norm_q(self.q(x)).view(b, s, n, d)
             k = self.norm_k(self.k(x)).view(b, s, n, d)
             v = self.v(x).view(b, s, n, d)
             return q, k, v
-
+        
         q, k, v = qkv_fn(x)
-
-        x = flash_attention(
-            q=rope_apply(q, grid_sizes, freqs),
-            k=rope_apply(k, grid_sizes, freqs),
-            v=v,
-            k_lens=seq_lens,
-            window_size=self.window_size)
+        if attn_mode == "flash":
+            x = flash_attention(
+                q=rope_apply(q, grid_sizes, freqs),
+                k=rope_apply(k, grid_sizes, freqs),
+                v=v,
+                k_lens=seq_lens,
+                window_size=self.window_size)
+        elif attn_mode == "low":
+            x = perturb_flash_attention_scores(
+                q=rope_apply(q, grid_sizes, freqs),
+                k=rope_apply(k, grid_sizes, freqs),
+                v=v,
+                k_lens=seq_lens,
+                grid_sizes=grid_sizes,
+                window_size=self.window_size,
+                block_idx=block_idx,
+                mode="low",
+                timestep = current_step,
+                cond_uncond=cond_uncond)
+            
+        elif attn_mode == "high":
+            x = perturb_flash_attention_scores(
+                q=rope_apply(q, grid_sizes, freqs),
+                k=rope_apply(k, grid_sizes, freqs),
+                v=v,
+                k_lens=seq_lens,
+                grid_sizes=grid_sizes,
+                window_size=self.window_size,
+                block_idx=block_idx,
+                mode="high",
+                timestep = current_step,
+                cond_uncond=cond_uncond)
+        elif attn_mode == "random":
+            x = perturb_flash_attention_scores(
+                q=rope_apply(q, grid_sizes, freqs),
+                k=rope_apply(k, grid_sizes, freqs),
+                v=v,
+                k_lens=seq_lens,
+                grid_sizes=grid_sizes,
+                window_size=self.window_size,
+                block_idx=block_idx,
+                mode="random",
+                timestep = current_step,
+                cond_uncond=cond_uncond)
+        elif attn_mode == "weight_high":
+            x = perturb_flash_attention_scores(
+                q=rope_apply(q, grid_sizes, freqs),
+                k=rope_apply(k, grid_sizes, freqs),
+                v=v,
+                k_lens=seq_lens,
+                grid_sizes=grid_sizes,
+                window_size=self.window_size,
+                block_idx=block_idx,
+                mode="weight_high",
+                timestep = current_step,
+                cond_uncond=cond_uncond)
+        elif attn_mode == "weight_low":
+            x = perturb_flash_attention_scores(
+                q=rope_apply(q, grid_sizes, freqs),
+                k=rope_apply(k, grid_sizes, freqs),
+                v=v,
+                k_lens=seq_lens,
+                grid_sizes=grid_sizes,
+                window_size=self.window_size,
+                block_idx=block_idx,
+                mode="weight_low",
+                timestep = current_step,
+                cond_uncond=cond_uncond)
+        elif attn_mode == "weight_entropy_ratio_high":
+            x = perturb_flash_attention_scores(
+                q=rope_apply(q, grid_sizes, freqs),
+                k=rope_apply(k, grid_sizes, freqs),
+                v=v,
+                k_lens=seq_lens,
+                grid_sizes=grid_sizes,
+                window_size=self.window_size,
+                block_idx=block_idx,
+                mode="weight_entropy_ratio_high",
+                timestep = current_step,
+                cond_uncond=cond_uncond)
+        elif attn_mode == "weight_entropy_ratio_low":
+            x = perturb_flash_attention_scores(
+                q=rope_apply(q, grid_sizes, freqs),
+                k=rope_apply(k, grid_sizes, freqs),
+                v=v,
+                k_lens=seq_lens,
+                grid_sizes=grid_sizes,
+                window_size=self.window_size,
+                block_idx=block_idx,
+                mode="weight_entropy_ratio_low",
+                timestep = current_step,
+                cond_uncond=cond_uncond)
+        else:
+            raise ValueError(f"Unknown attn_mode: {attn_mode}")
 
         # output
         x = x.flatten(2)
@@ -225,6 +314,10 @@ class WanAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
+        current_step=0,
+        attn_mode="flash",
+        block_idx=0,
+        cond_uncond=None,
     ):
         r"""
         Args:
@@ -242,7 +335,10 @@ class WanAttentionBlock(nn.Module):
         # self-attention
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
-            seq_lens, grid_sizes, freqs)
+            seq_lens, grid_sizes, freqs,
+            current_step = current_step,
+            attn_mode=attn_mode,block_idx=block_idx,
+            cond_uncond = cond_uncond)  #传入时间步
         with torch.amp.autocast('cuda', dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
 
@@ -317,7 +413,9 @@ class WanModel(ModelMixin, ConfigMixin):
                  window_size=(-1, -1),
                  qk_norm=True,
                  cross_attn_norm=True,
-                 eps=1e-6):
+                 eps=1e-6,
+                 current_step=0
+                 ):
         r"""
         Initialize the diffusion model backbone.
 
@@ -414,6 +512,10 @@ class WanModel(ModelMixin, ConfigMixin):
         context,
         seq_len,
         y=None,
+        current_step=0
+        ,attn_mode="flash",
+        cond_uncond=None,
+        #传入时间步
     ):
         r"""
         Forward pass through the diffusion model
@@ -485,9 +587,13 @@ class WanModel(ModelMixin, ConfigMixin):
             freqs=self.freqs,
             context=context,
             context_lens=context_lens)
-
+        idx = 0
         for block in self.blocks:
-            x = block(x, **kwargs)
+            if idx % 5 == 0:
+                x = block(x, **kwargs,current_step=current_step,attn_mode=attn_mode,block_idx=idx,cond_uncond=cond_uncond)
+            else:
+                x = block(x, **kwargs,current_step=current_step,attn_mode="flash",block_idx=idx,cond_uncond=cond_uncond)
+            idx+=1  #传入时间步
 
         # head
         x = self.head(x, e)

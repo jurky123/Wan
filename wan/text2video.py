@@ -327,45 +327,56 @@ class WanT2V:
                 raise NotImplementedError("Unsupported solver.")
 
             # sample videos
-            latents = noise
+            videos = []
+            sample_schedulers = {}
+            import copy
 
-            arg_c = {'context': context, 'seq_len': seq_len}
-            arg_null = {'context': context_null, 'seq_len': seq_len}
+            sample_schedulers['flash'] = copy.deepcopy(sample_scheduler)
+            sample_schedulers['weight_low'] = copy.deepcopy(sample_scheduler)
+            sample_schedulers['weight_high'] = copy.deepcopy(sample_scheduler)
+            sample_schedulers['low'] = copy.deepcopy(sample_scheduler)
+            sample_schedulers['high'] = copy.deepcopy(sample_scheduler)
+            sample_schedulers['random'] = copy.deepcopy(sample_scheduler)
+            #for attn_mode in ["low", "high","weight_low","weight_high","random","flash"]:
+            for attn_mode in ["low", "high","weight_low","weight_high","random","flash"]:
+            #for attn_mode in ["flash"]:
+                latents = noise
+                arg_c = {'context': context, 'seq_len': seq_len}
+                arg_null = {'context': context_null, 'seq_len': seq_len}
 
-            for _, t in enumerate(tqdm(timesteps)):
-                latent_model_input = latents
-                timestep = [t]
+                for _, t in enumerate(tqdm(timesteps)):
+                    latent_model_input = latents
+                    timestep = [t]
 
-                timestep = torch.stack(timestep)
+                    timestep = torch.stack(timestep)
 
-                model = self._prepare_model_for_timestep(
-                    t, boundary, offload_model)
-                sample_guide_scale = guide_scale[1] if t.item(
-                ) >= boundary else guide_scale[0]
+                    model = self._prepare_model_for_timestep(
+                        t, boundary, offload_model)
+                    sample_guide_scale = guide_scale[1] if t.item(
+                    ) >= boundary else guide_scale[0]
 
-                noise_pred_cond = model(
-                    latent_model_input, t=timestep, **arg_c)[0]
-                noise_pred_uncond = model(
-                    latent_model_input, t=timestep, **arg_null)[0]
+                    noise_pred_cond = model(
+                        latent_model_input, t=timestep, **arg_c, current_step=_, attn_mode=attn_mode,cond_uncond = "cond")[0]
+                    noise_pred_uncond = model(
+                        latent_model_input, t=timestep, **arg_null, current_step=_, attn_mode=attn_mode,cond_uncond="uncond")[0]
 
-                noise_pred = noise_pred_uncond + sample_guide_scale * (
-                    noise_pred_cond - noise_pred_uncond)
+                    noise_pred = noise_pred_uncond + sample_guide_scale * (
+                        noise_pred_cond - noise_pred_uncond)
 
-                temp_x0 = sample_scheduler.step(
-                    noise_pred.unsqueeze(0),
-                    t,
-                    latents[0].unsqueeze(0),
-                    return_dict=False,
-                    generator=seed_g)[0]
-                latents = [temp_x0.squeeze(0)]
-
-            x0 = latents
-            if offload_model:
-                self.low_noise_model.cpu()
-                self.high_noise_model.cpu()
-                torch.cuda.empty_cache()
-            if self.rank == 0:
-                videos = self.vae.decode(x0)
+                    temp_x0 = sample_schedulers[attn_mode].step(
+                        noise_pred.unsqueeze(0),
+                        t,
+                        latents[0].unsqueeze(0),
+                        return_dict=False,
+                        generator=seed_g)[0]
+                    latents = [temp_x0.squeeze(0)]
+                x0 = latents
+                if offload_model:
+                    self.low_noise_model.cpu()
+                    self.high_noise_model.cpu()
+                    torch.cuda.empty_cache()
+                if self.rank == 0:
+                    videos.append(self.vae.decode(x0)[0])
 
         del noise, latents
         del sample_scheduler
@@ -375,4 +386,4 @@ class WanT2V:
         if dist.is_initialized():
             dist.barrier()
 
-        return videos[0] if self.rank == 0 else None
+        return videos if self.rank == 0 else None
